@@ -4,3 +4,5 @@ This implementation trains U-Net on images of segmented nuclei for kaggle's 2018
 ```shell
 python train.py
 ```
+
+The highest validation IOU by this model is 0.567
