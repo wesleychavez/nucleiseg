@@ -8,4 +8,3 @@ optimizer = ['adam','rmsprop']
 batch_size = [16,32]
 epochs = 50
 k = 3
-patience = 5

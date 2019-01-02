@@ -1,3 +1,9 @@
+# train.py, along with config.py trains U-Net on images of segmented nuclei
+# for kaggle's 2018 Data Science Bowl.  It performs a grid search on batch 
+# sizes and optimizers, and k-fold cross-validation on the dataset.  Metrics
+# plots are saved for each hyperparameter combination.
+#
+# Wesley Chavez, 01-01-2019
 import os
 import sys
 import random
@@ -11,6 +17,7 @@ import itertools
 from sklearn.model_selection import KFold
 from skimage.io import imread
 from skimage.transform import resize
+from skimage.morphology import label
 
 from keras.models import Model
 from keras.layers import Input
@@ -20,17 +27,70 @@ from keras.layers.pooling import MaxPooling2D
 from keras.layers.merge import concatenate
 from keras import backend as K
 
-# Define IoU metric
-def mean_iou(y_true, y_pred):
+def iou_metric(y_true_in, y_pred_in, print_table=False):
+    labels = label(y_true_in > 0.5)
+    y_pred = label(y_pred_in > 0.5)
+    
+    true_objects = len(np.unique(labels))
+    pred_objects = len(np.unique(y_pred))
+
+    intersection = np.histogram2d(labels.flatten(), y_pred.flatten(), bins=(true_objects, pred_objects))[0]
+
+    # Compute areas (needed for finding the union between all objects)
+    area_true = np.histogram(labels, bins = true_objects)[0]
+    area_pred = np.histogram(y_pred, bins = pred_objects)[0]
+    area_true = np.expand_dims(area_true, -1)
+    area_pred = np.expand_dims(area_pred, 0)
+
+    # Compute union
+    union = area_true + area_pred - intersection
+
+    # Exclude background from the analysis
+    intersection = intersection[1:,1:]
+    union = union[1:,1:]
+    union[union == 0] = 1e-9
+
+    # Compute the intersection over union
+    iou = intersection / union
+
+    # Precision helper function
+    def precision_at(threshold, iou):
+        matches = iou > threshold
+        true_positives = np.sum(matches, axis=1) == 1   # Correct objects
+        false_positives = np.sum(matches, axis=0) == 0  # Missed objects
+        false_negatives = np.sum(matches, axis=1) == 0  # Extra objects
+        tp, fp, fn = np.sum(true_positives), np.sum(false_positives), np.sum(false_negatives)
+        return tp, fp, fn
+
+    # Loop over IoU thresholds
     prec = []
+    if print_table:
+        print("Thresh\tTP\tFP\tFN\tPrec.")
     for t in np.arange(0.5, 1.0, 0.05):
-        y_pred_ = tf.to_int32(y_pred > t)
-        score, up_opt = tf.metrics.mean_iou(y_true, y_pred_, 2)
-        K.get_session().run(tf.local_variables_initializer())
-        with tf.control_dependencies([up_opt]):
-            score = tf.identity(score)
-        prec.append(score)
-    return K.mean(K.stack(prec), axis=0)
+        tp, fp, fn = precision_at(t, iou)
+        if (tp + fp + fn) > 0:
+            p = tp / (tp + fp + fn)
+        else:
+            p = 0
+        if print_table:
+            print("{:1.3f}\t{}\t{}\t{}\t{:1.3f}".format(t, tp, fp, fn, p))
+        prec.append(p)
+    
+    if print_table:
+        print("AP\t-\t-\t-\t{:1.3f}".format(np.mean(prec)))
+    return np.mean(prec)
+
+def iou_metric_batch(y_true_in, y_pred_in):
+    batch_size = y_true_in.shape[0]
+    metric = []
+    for batch in range(batch_size):
+        value = iou_metric(y_true_in[batch], y_pred_in[batch])
+        metric.append(value)
+    return np.array(np.mean(metric), dtype=np.float32)
+
+def mean_iou(label, pred):
+    metric_value = tf.py_func(iou_metric_batch, [label, pred], tf.float32)
+    return metric_value
 
 # Build U-Net model
 def create_model(img_height,img_width,img_channels,opt):
@@ -135,7 +195,6 @@ def main():
 
     # Loop over k folds of training/testing data
     kf = KFold(n_splits=config.k, shuffle=True, random_state=seed)
-
     k_iter = -1    
     for train_index, val_index in kf.split(np.zeros(X_train.shape[0])):
         k_iter = k_iter + 1
@@ -152,7 +211,6 @@ def main():
             losses[i,k_iter,:] = history.history['loss']
             val_mean_ious[i,k_iter,:] = history.history['val_mean_iou']
             val_losses[i,k_iter,:] = history.history['val_loss']
-            print (val_mean_ious)
 
     # Mean and std across k folds
     mean_iou = np.mean(mean_ious,axis=1)
@@ -216,24 +274,26 @@ def main():
         ax[1].set_ylabel('Loss')
         ax[1].set_xlabel('Epoch')
         ax[1].legend(['Train', 'Val'], loc='upper left')
-        print (str(combos[i]))
         out_name = str(combos[i])
         out_name = out_name.replace(" ", "")
         out_name = out_name.replace("'", "")
-        out_name = out_name.replace("(", "_")
-        out_name = out_name.replace(")", "_")
+        out_name = out_name.replace("(", "")
+        out_name = out_name.replace(")", "")
         out_name = out_name.replace(",", "_")
         fig.savefig(out_name + '_iouandloss.png')
 
-    # Highest iou after training, not by epoch
-    mean_val_iou_bymodel = np.mean(mean_val_ious[:,:,-1],axis=1)
+    # Highest validation iou, at any epoch, for any data fold
+    max_val_iou_bymodel = []
+    for i in range(len(combos)):
+        max_val_iou_bymodel.append(np.max(val_mean_ious[i,:,:]))
+    #mean_val_iou_bymodel = np.mean(val_mean_ious[:,:,-1],axis=1)
     print('Model with highest mean validation iou:')
-    print (combos[np.argmax(mean_val_iou_bymodel)])
-    print (np.max(mean_val_iou_bymodel))
+    print (combos[np.argmax(max_val_iou_bymodel)])
+    print (np.max(max_val_iou_bymodel))
     print ('------------------------------')
-    for i in range(len(mean_val_iou_bymodel)):
+    for i in range(len(max_val_iou_bymodel)):
         print(combos[i])
-        print(mean_val_iou_bymodel[i])
+        print(max_val_iou_bymodel[i])
 
 if __name__  == '__main__':
     main()
